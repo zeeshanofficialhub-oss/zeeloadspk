@@ -1,0 +1,117 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Validation Blueprints ---
+
+    function isValidUser(data) {
+      return data.uid == request.auth.uid 
+        && data.fullName is string && data.fullName.size() <= 100
+        && data.role in ['carrier', 'company', 'admin']
+        && data.phoneNumber is string && data.phoneNumber.size() <= 20
+        && (data.whatsapp == null || (data.whatsapp is string && data.whatsapp.size() <= 20));
+    }
+
+    function isValidLoad(data) {
+      return data.providerId is string
+        && data.pickupCity is string && data.pickupCity.size() <= 100
+        && data.dropCity is string && data.dropCity.size() <= 100
+        && data.truckTypeRequired is string && data.truckTypeRequired.size() <= 100
+        && data.status in ["available", "applied", "in-transit", "delivered", "cancelled"]
+        && (data.priceOffer is number || data.priceOffer == null);
+    }
+
+    function isValidApplication(data) {
+      return data.carrierId == request.auth.uid
+        && data.status == 'pending'
+        && isValidId(data.loadId);
+    }
+
+    // --- Resource Matches ---
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isSignedIn() && (resource.data.role == 'company' || resource.data.role == 'carrier');
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().isVerified == true;
+      allow update: if (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'city', 'whatsapp', 'phoneNumber', 'isVerified']) && isValidUser(incoming()) && incoming().isVerified == existing().isVerified)
+                   || isAdmin();
+    }
+
+    match /carriers/{userId} {
+      allow get: if (isSignedIn() && isValidId(userId)) || isAdmin();
+      allow create: if isOwner(userId) && isValidId(userId);
+      allow update: if isOwner(userId) || isAdmin();
+    }
+
+    match /companies/{userId} {
+      allow get: if (isSignedIn() && isValidId(userId)) || isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin();
+    }
+
+    match /loads/{loadId} {
+      allow get: if isSignedIn() && isValidId(loadId);
+      allow list: if true; // Allow anyone to browse available loads
+      allow create: if isSignedIn() && isValidLoad(incoming());
+      allow update: if (isSignedIn() && (
+        // Provider can update their own load
+        (existing().providerId == request.auth.uid && incoming().providerId == existing().providerId)
+        // Carrier can update status if assigned
+        || (existing().assignedCarrierId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
+      )) || isAdmin();
+      allow delete: if isAdmin() || (isSignedIn() && existing().providerId == request.auth.uid);
+    }
+
+    match /applications/{appId} {
+      allow get: if isSignedIn() && isValidId(appId);
+      allow list: if isSignedIn() && (resource.data.carrierId == request.auth.uid || get(/databases/$(database)/documents/loads/$(resource.data.loadId)).data.providerId == request.auth.uid);
+      allow create: if isSignedIn() && isValidApplication(incoming());
+      allow update: if (isSignedIn() && (
+        // Carrier can cancel
+        (existing().carrierId == request.auth.uid && incoming().status == 'cancelled' && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
+        // Provider can accept/reject
+        || (get(/databases/$(database)/documents/loads/$(existing().loadId)).data.providerId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status']) && incoming().status in ['accepted', 'rejected'])
+      )) || isAdmin();
+    }
+
+    match /notifications/{notifId} {
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.userId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+      allow create: if false; // System only
+    }
+    
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+    }
+  }
+}

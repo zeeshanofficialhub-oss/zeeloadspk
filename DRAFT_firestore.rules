@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Validation Blueprints ---
+
+    function isValidUser(data) {
+      return data.uid == request.auth.uid 
+        && data.fullName is string && data.fullName.size() <= 100
+        && data.role in ['carrier', 'company', 'admin']
+        && data.phoneNumber is string && data.phoneNumber.size() <= 20;
+    }
+
+    function isValidLoad(data) {
+      return data.providerId == request.auth.uid
+        && data.pickupCity is string && data.pickupCity.size() <= 50
+        && data.dropCity is string && data.dropCity.size() <= 50
+        && data.truckType is string
+        && data.status in ['open', 'assigned', 'picked', 'in-transit', 'delivered', 'cancelled']
+        && data.createdAt == request.time;
+    }
+
+    // --- Resource Matches ---
+
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && (resource.data.role == 'company' || resource.data.role == 'carrier'); // Limited list for discovery
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().isVerified == true;
+      allow update: if (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'city', 'whatsapp', 'phoneNumber']) && isValidUser(incoming()))
+                   || isAdmin();
+    }
+
+    match /carriers/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId); // Schema check in app code for now, simplified for draft
+      allow update: if isOwner(userId) || isAdmin();
+    }
+
+    match /companies/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin();
+    }
+
+    match /loads/{loadId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidLoad(incoming());
+      allow update: if (isSignedIn() && (
+        // Provider can update their own load
+        (existing().providerId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasAny(['status', 'description', 'budget', 'assignedCarrierId']))
+        // Carrier can update status if assigned
+        || (existing().assignedCarrierId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
+      )) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /applications/{appId} {
+      allow read: if isSignedIn() && (resource.data.carrierId == request.auth.uid || get(/databases/$(database)/documents/loads/$(resource.data.loadId)).data.providerId == request.auth.uid);
+      allow create: if isSignedIn() && incoming().carrierId == request.auth.uid;
+      allow update: if (isSignedIn() && (
+        // Carrier can cancel
+        (existing().carrierId == request.auth.uid && incoming().status == 'cancelled')
+        // Provider can accept/reject
+        || (get(/databases/$(database)/documents/loads/$(existing().loadId)).data.providerId == request.auth.uid)
+      )) || isAdmin();
+    }
+
+    match /notifications/{notifId} {
+      allow read: if isOwner(resource.data.userId);
+      allow update: if isOwner(resource.data.userId) && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+      allow create: if isAdmin(); // Only system/admin can create
+    }
+    
+    // Admin list
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+    }
+  }
+}
